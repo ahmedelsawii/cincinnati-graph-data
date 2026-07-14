@@ -19,6 +19,10 @@ import yaml
 
 
 _VERSION_REGEXP = re.compile('^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$')
+# A digest is an algorithm name and a hex value; constraining both keeps the
+# registry-supplied string from steering the on-disk cache path (no separators,
+# no "..").
+_DIGEST_REGEXP = re.compile('^[a-z0-9]+:[0-9a-f]+$')
 _HTTP_TIMEOUT_SECONDS = 30
 _MAX_BLOB_BYTES = 1024 * 1024 * 1024  # release-image layers are far smaller; this only guards runaway responses
 _MAX_METADATA_BYTES = 10 * 1024 * 1024  # config blobs and release-metadata files are a few KiB
@@ -80,7 +84,11 @@ def load_nodes(directory, registry, repository):
             if 'expiration' in entry:
                 continue
 
-            algo, hash = entry['manifest_digest'].split(':', 1)
+            digest = entry['manifest_digest']
+            if not _DIGEST_REGEXP.match(digest):
+                _LOGGER.warning('skipping tag {} with malformed manifest_digest {!r}'.format(entry.get('name'), digest))
+                continue
+            algo, hash = digest.split(':', 1)
             pullspec = 'quay.io/{}@{}:{}'.format(repository, algo, hash)
             node = {'payload': pullspec}
             path = os.path.join(directory, algo, hash)

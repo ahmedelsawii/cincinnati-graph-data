@@ -3,6 +3,15 @@
 Review of the repository state at commit `a10d1af` (branch
 `claude/security-fable-capabilities-k4z0gx`, identical to `master`).
 
+> **Follow-up:** a later verification pass confirmed these fixes and found
+> additional issues — most notably a **High**-severity path traversal
+> (arbitrary file write) via a registry-supplied `manifest_digest`, plus two
+> CI-hardening gaps. See [`docs/VULNERABILITIES.md`](docs/VULNERABILITIES.md)
+> for the consolidated, up-to-date list with before/after evidence and status.
+> The "no path-traversal exposure" note below refers specifically to the tar
+> extraction path and did not cover the cache-path construction (finding V6 in
+> the consolidated doc).
+
 ## Scope and method
 
 * Manual review of all executable code: `hack/graph-util.py`, `hack/errata.py`.

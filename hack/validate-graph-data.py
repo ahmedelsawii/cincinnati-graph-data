@@ -28,8 +28,62 @@ import yaml
 
 
 _VERSION_REGEXP = re.compile('^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$')
-_NESTED_QUANTIFIER_REGEXP = re.compile(r'\([^)]*[+*][^)]*\)\s*[+*{]')
+_QUANTIFIERS = frozenset('*+{')
 _MATCH_TIMEOUT_SECONDS = 1.0
+
+
+def _scan_regex(pattern):
+    """Yield (index, char) over pattern, skipping escaped chars and reporting a
+    flag for whether the current position is inside a [...] character class, so
+    callers can reason about regex structure without misreading class or escaped
+    literals as metacharacters."""
+    i = 0
+    in_class = False
+    while i < len(pattern):
+        char = pattern[i]
+        if char == '\\':
+            i += 2
+            continue
+        if in_class:
+            if char == ']':
+                in_class = False
+            i += 1
+            continue
+        if char == '[':
+            in_class = True
+            i += 1
+            continue
+        yield i, char
+        i += 1
+
+
+def _body_has_alternation_or_quantifier(body):
+    for _, char in _scan_regex(body):
+        if char == '|' or char in _QUANTIFIERS:
+            return True
+    return False
+
+
+def risky_quantified_group(pattern):
+    """Return True when pattern contains a group that is itself quantified and
+    whose body holds an alternation or another quantifier -- the shape behind
+    catastrophic backtracking (e.g. (a+)+, (a|a)*, ((a+))+, (a|ab)*).  A group
+    with an alternation that is not quantified (e.g. 4\\.1\\.(18|20)) is safe and
+    is not flagged."""
+    stack = []
+    chars = list(_scan_regex(pattern))
+    for order, (index, char) in enumerate(chars):
+        if char == '(':
+            stack.append(index)
+        elif char == ')' and stack:
+            open_index = stack.pop()
+            # A quantifier applies only if it sits immediately after the ')'.
+            following = pattern[index + 1] if index + 1 < len(pattern) else ''
+            if following in _QUANTIFIERS:
+                body = pattern[open_index + 1:index]
+                if _body_has_alternation_or_quantifier(body):
+                    return True
+    return False
 
 
 def match_with_timer(pattern, text, seconds=_MATCH_TIMEOUT_SECONDS):
@@ -108,8 +162,8 @@ def validate_blocked_edges(directory, versions, errors):
         except re.error as error:
             errors.append('{}: from pattern {!r} does not compile: {}'.format(path, data['from'], error))
             continue
-        if _NESTED_QUANTIFIER_REGEXP.search(data['from']):
-            errors.append('{}: from pattern {!r} nests quantifiers, risking catastrophic backtracking'.format(path, data['from']))
+        if risky_quantified_group(data['from']):
+            errors.append('{}: from pattern {!r} quantifies a group containing an alternation or quantifier, risking catastrophic backtracking'.format(path, data['from']))
             continue
         for text in sample_texts:
             try:
