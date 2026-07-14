@@ -7,6 +7,7 @@ import codecs
 import datetime
 import json
 import logging
+import os
 import time
 import urllib.parse
 import urllib.request
@@ -14,6 +15,7 @@ import urllib.request
 
 logging.basicConfig(level=logging.DEBUG)
 _LOGGER = logging.getLogger()
+_HTTP_TIMEOUT_SECONDS = 30
 
 
 def load(path):
@@ -43,8 +45,13 @@ def run(poll_period=datetime.timedelta(seconds=3600), cache=None, webhook=None, 
                     'synopsis': message['synopsis'],
                 }
         next_time += poll_period
-        _LOGGER.debug('sleep until {}'.format(next_time))
-        time.sleep((next_time - datetime.datetime.now()).seconds)
+        delay = (next_time - datetime.datetime.now()).total_seconds()
+        if delay > 0:
+            _LOGGER.debug('sleep until {}'.format(next_time))
+            time.sleep(delay)
+        else:
+            _LOGGER.debug('poll cycle overran the period; polling again immediately')
+            next_time = datetime.datetime.now()
 
 
 def poll(data_grepper='https://datagrepper.engineering.redhat.com/raw', period=None):
@@ -61,7 +68,7 @@ def poll(data_grepper='https://datagrepper.engineering.redhat.com/raw', period=N
         uri = '{}?{}'.format(data_grepper, urllib.parse.urlencode(params))
         _LOGGER.debug('query page {}: {}'.format(page, uri))
         try:
-            with urllib.request.urlopen(uri) as f:
+            with urllib.request.urlopen(uri, timeout=_HTTP_TIMEOUT_SECONDS) as f:
                 data = json.load(codecs.getreader('utf-8')(f))  # hack: should actually respect Content-Type
         except Exception as error:
             _LOGGER.error('{}: {}'.format(uri, error))
@@ -82,24 +89,22 @@ def notify(message, webhook=None):
         print(message)
         return
 
-    urllib.request.urlopen(webhook, data=urllib.parse.urlencode({
-        'payload': {
+    data = urllib.parse.urlencode({
+        'payload': json.dumps({
             'text': '{fulladvisory} shipped {when}: {synopsis}'.format(**message),
-        },
-    }).encode('utf-8'))
+        }),
+    }).encode('utf-8')
+    urllib.request.urlopen(webhook, data=data, timeout=_HTTP_TIMEOUT_SECONDS).close()
 
 
 if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Poll for newly published OCP errata, and optionally push notifications to Slack.')
-    parser.add_argument('webhook', nargs='?', help='Set this to actually push notifications to Slack.')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='Poll for newly published OCP errata, and optionally push notifications to Slack.  Set the SLACK_WEBHOOK_URL environment variable to actually push notifications; the webhook is a credential, so it is not accepted on the command line.')
+    parser.parse_args()
 
     cache_path = '.errata.json'
     cache = load(path=cache_path)
     try:
-        run(cache=cache, webhook=args.webhook)
+        run(cache=cache, webhook=os.environ.get('SLACK_WEBHOOK_URL'))
     except:
         save(path=cache_path, cache=cache)
         raise
