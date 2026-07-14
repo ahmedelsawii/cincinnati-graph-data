@@ -87,6 +87,33 @@ positional argument, exposing it in process listings and shell history.
   stringifies the nested dict as a Python repr rather than JSON — the
   notification path likely never worked against real Slack webhooks.
 
+## Remediation status
+
+All findings above have been fixed on this branch:
+
+* **Finding 1 (unvalidated regexes / no CI):** added
+  `hack/validate-graph-data.py`, a presubmit that schema-checks every
+  channel and blocked-edge file, compiles every `from` pattern, rejects
+  nested-quantifier constructs, and time-boxes sample matches. A GitHub
+  Actions workflow (`.github/workflows/validate.yaml`, least-privilege
+  `contents: read`) runs it on every pull request and push to master.
+* **Finding 2 (unverified blobs):** `hack/graph-util.py` now downloads
+  config and layer blobs through `get_verified_blob`, which streams with a
+  size cap and rejects any blob whose hash does not match the requested
+  digest. Tar members are extracted via `extract_metadata_member`, which
+  rejects non-regular-file members (e.g. symlinks) and oversized entries.
+* **Finding 3 (exception types):** YAML loads now catch `yaml.YAMLError`
+  and regex compilation catches `re.error`, so malformed input produces
+  the intended contextual errors.
+* **Finding 4 (webhook on CLI):** `hack/errata.py` reads the Slack webhook
+  from the `SLACK_WEBHOOK_URL` environment variable; the positional
+  argument is gone.
+* **Finding 5 (robustness):** every `urlopen` call in both scripts sets a
+  30-second timeout; Python 2 fallbacks are removed (`python3` shebang);
+  the poll loop uses `total_seconds()` and handles overruns; the Slack
+  payload is JSON-encoded so notifications actually conform to the
+  webhook format.
+
 ## Good practices observed
 
 * `yaml.SafeLoader` is used for every YAML load — no unsafe

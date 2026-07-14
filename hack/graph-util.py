@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import codecs
 import functools
+import hashlib
 import io
 import json
 import logging
@@ -12,20 +13,15 @@ import re
 import shutil
 import tarfile
 
+from urllib.request import Request, urlopen
+
 import yaml
-
-try:
-    from builtins import FileExistsError  # Python 3
-except ImportError:
-    FileExistsError = OSError  # sloppy hack for Python 2
-
-try:
-    from urllib.request import Request, urlopen  # Python 3
-except ImportError:
-    from urllib2 import Request, urlopen  # Python 2
 
 
 _VERSION_REGEXP = re.compile('^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$')
+_HTTP_TIMEOUT_SECONDS = 30
+_MAX_BLOB_BYTES = 1024 * 1024 * 1024  # release-image layers are far smaller; this only guards runaway responses
+_MAX_METADATA_BYTES = 10 * 1024 * 1024  # config blobs and release-metadata files are a few KiB
 logging.basicConfig(format='%(levelname)s: %(message)s')
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,9 +73,8 @@ def load_nodes(directory, registry, repository):
     repository_uri = 'https://{}/api/v1/repository/{}'.format(registry, repository)
     page = 1
     while True:
-        f = urlopen('{}/tag/?page={}'.format(repository_uri, page))
-        data = json.load(codecs.getreader('utf-8')(f))
-        f.close()  # no context manager with-statement because in Python 2: AttributeError: addinfourl instance has no attribute '__exit__'
+        with urlopen('{}/tag/?page={}'.format(repository_uri, page), timeout=_HTTP_TIMEOUT_SECONDS) as f:
+            data = json.load(codecs.getreader('utf-8')(f))
 
         for entry in data['tags']:
             if 'expiration' in entry:
@@ -93,7 +88,7 @@ def load_nodes(directory, registry, repository):
                 with open(path) as f:
                     try:
                         meta = yaml.load(f, Loader=yaml.SafeLoader)
-                    except ValueError as error:
+                    except yaml.YAMLError as error:
                         raise ValueError('failed to load YAML from {}: {}'.format(path, error))
                     if not meta:
                         continue
@@ -105,10 +100,7 @@ def load_nodes(directory, registry, repository):
                 except (KeyError, ValueError) as error:
                     _LOGGER.warning('unable to get release metadata for {} {} : {}'.format(pullspec, entry, error))
                     meta = {}
-                try:
-                    os.mkdir(os.path.join(directory, algo))  # os.makedirs' exist_ok is new in Python 3.2
-                except FileExistsError:
-                    pass
+                os.makedirs(os.path.join(directory, algo), exist_ok=True)
                 try:
                     with open(path, 'w') as f:
                         yaml.safe_dump(meta, f, default_flow_style=False)
@@ -160,7 +152,7 @@ def load_channels(directory, nodes):
             with open(path) as f:
                 try:
                     data = yaml.load(f, Loader=yaml.SafeLoader)
-                except ValueError as error:
+                except yaml.YAMLError as error:
                     raise ValueError('failed to load YAML from {}: {}'.format(path, error))
                 channel = data['name']
                 for version in data['versions']:
@@ -197,7 +189,7 @@ def block_edges(directory, nodes):
             with open(path) as f:
                 try:
                     data = yaml.load(f, Loader=yaml.SafeLoader)
-                except ValueError as error:
+                except yaml.YAMLError as error:
                     raise ValueError('failed to load YAML from {}: {}'.format(path, error))
                 to_version = _VERSION_REGEXP.match(data['to'])
                 if not to_version:
@@ -215,8 +207,8 @@ def block_edges(directory, nodes):
                     raise ValueError('{} claims version {}, but the only nodes with version {} are for {}'.format(path, data['to'], remove_build(semver_match=to_version), sorted(to_nodes.keys())))
                 try:
                     from_regexp = re.compile(data['from'])
-                except ValueError as error:
-                    raise ValueError('{} invalid from regexp: {}'.format(path, data['from']))
+                except re.error as error:
+                    raise ValueError('{} invalid from regexp {!r}: {}'.format(path, data['from'], error))
                 for to_node in arch_matching_to_nodes:
                     if to_node.get('previous'):
                         to_node['previous'] = {version for version in to_node['previous'] if not from_regexp.match(version)}
@@ -344,10 +336,41 @@ def manifest_uri(node):
 
 
 def get_labels(node):
-    f = urlopen('{}/labels'.format(manifest_uri(node=node)))
-    data = json.load(codecs.getreader('utf-8')(f))
-    f.close()  # no context manager with-statement because in Python 2: AttributeError: addinfourl instance has no attribute '__exit__'
+    with urlopen('{}/labels'.format(manifest_uri(node=node)), timeout=_HTTP_TIMEOUT_SECONDS) as f:
+        data = json.load(codecs.getreader('utf-8')(f))
     return {label['key']: label for label in data['labels']}
+
+
+def get_verified_blob(uri, digest, max_bytes=_MAX_BLOB_BYTES):
+    algo, _, expected_hash = digest.partition(':')
+    try:
+        hasher = hashlib.new(algo)
+    except (TypeError, ValueError) as error:
+        raise ValueError('unsupported digest algorithm in {!r}: {}'.format(digest, error))
+    chunks = []
+    size = 0
+    with urlopen(uri, timeout=_HTTP_TIMEOUT_SECONDS) as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError('blob {} from {} exceeds the {}-byte limit'.format(digest, uri, max_bytes))
+            hasher.update(chunk)
+            chunks.append(chunk)
+    if hasher.hexdigest() != expected_hash:
+        raise ValueError('digest mismatch for {}: expected {}, calculated {}:{}'.format(uri, digest, algo, hasher.hexdigest()))
+    return b''.join(chunks)
+
+
+def extract_metadata_member(tar, name):
+    member = tar.getmember(name)  # raises KeyError when the member is absent
+    if not member.isfile():
+        raise ValueError('{} tar member is a {}, not a regular file'.format(name, member.type))
+    if member.size > _MAX_METADATA_BYTES:
+        raise ValueError('{} tar member is {} bytes, exceeding the {}-byte limit'.format(name, member.size, _MAX_METADATA_BYTES))
+    return tar.extractfile(member)
 
 
 def delete_label(node, label, token, key=None):
@@ -358,10 +381,9 @@ def delete_label(node, label, token, key=None):
     _LOGGER.info('{} {} {}{}'.format(get_log_version(node), 'delete', uri, suffix))
     if not token:
         return  # dry run
-    request = Request(uri)
+    request = Request(uri, method='DELETE')
     request.add_header('Authorization', 'Bearer {}'.format(token))
-    request.get_method = lambda: 'DELETE'
-    return urlopen(request)
+    return urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS)
 
 
 def post_label(node, label, token):
@@ -372,7 +394,7 @@ def post_label(node, label, token):
     request = Request(uri, json.dumps(label).encode('utf-8'))
     request.add_header('Authorization', 'Bearer {}'.format(token))
     request.add_header('Content-Type', 'application/json')
-    return urlopen(request)
+    return urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS)
 
 
 def get_release_metadata(node):
@@ -383,9 +405,8 @@ def get_release_metadata(node):
         raise ValueError('non-Quay pullspec: {}'.format(pullspec))
     name = name[len(prefix):]
 
-    f = urlopen(manifest_uri(node=node))
-    data = json.load(codecs.getreader('utf-8')(f))
-    f.close()  # no with-statement because in Python 2: AttributeError: addinfourl instance has no attribute '__exit__'
+    with urlopen(manifest_uri(node=node), timeout=_HTTP_TIMEOUT_SECONDS) as f:
+        data = json.load(codecs.getreader('utf-8')(f))
 
     manifest = json.loads(data['manifest_data'])
     if 'mediaType' in manifest:
@@ -395,9 +416,8 @@ def get_release_metadata(node):
         if manifest['config']['mediaType'] != 'application/vnd.docker.container.image.v1+json':
             raise ValueError('unsupported media type for {} config: {}'.format(node['payload'], manifest['config']['mediaType']))
         uri = 'https://quay.io/v2/{}/blobs/{}'.format(name, manifest['config']['digest'])
-        f = urlopen(uri)
-        config = json.load(codecs.getreader('utf-8')(f))
-        f.close()  # no with-statement because in Python 2: AttributeError: addinfourl instance has no attribute '__exit__'
+        config_bytes = get_verified_blob(uri=uri, digest=manifest['config']['digest'], max_bytes=_MAX_METADATA_BYTES)
+        config = json.loads(config_bytes.decode('utf-8'))
         image_config_data = {}
         for prop in ['architecture', 'os']:
             try:
@@ -436,16 +456,14 @@ def get_release_metadata(node):
             raise ValueError('unsupported media type for {} layer {}: {}'.format(node['payload'], layer['digest'], layer['mediaType']))
 
         uri = 'https://quay.io/v2/{}/blobs/{}'.format(name, layer['digest'])
-        f = urlopen(uri)
-        layer_bytes = f.read()
-        f.close()
+        layer_bytes = get_verified_blob(uri=uri, digest=layer['digest'])
 
         with tarfile.open(fileobj=io.BytesIO(layer_bytes), mode='r:gz') as tar:
             try:
-                f = tar.extractfile('release-manifests/release-metadata')
+                f = extract_metadata_member(tar, 'release-manifests/release-metadata')
             except KeyError:
                 try:
-                    f = tar.extractfile('release-manifests/image-references')
+                    f = extract_metadata_member(tar, 'release-manifests/image-references')
                 except KeyError:
                     continue
                 else:
